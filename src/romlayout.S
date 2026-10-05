@@ -826,10 +826,11 @@ irqentry_arg:
         DECL_IRQ_ENTRY hwpic1
         DECL_IRQ_ENTRY hwpic2
 
-        // Hyper-V Gen2 timer tick: the LAPIC timer stands in for the
-        // missing PIT/PIC (see hyperv_tick_setup). Chain to the IRQ0
-        // vector, then EOI the LAPIC through the Hyper-V synthetic EOI
-        // MSR, which unlike the xAPIC MMIO page is reachable here.
+        // Hyper-V Gen2 timer tick: a one-shot synthetic timer in direct
+        // mode stands in for the missing PIT/PIC (see hyperv_tick_setup).
+        // Chain to the IRQ0 vector, EOI the LAPIC through the synthetic EOI
+        // MSR (unlike the xAPIC MMIO page it is reachable here), then re-arm
+        // the timer one PIT tick after its previous expiry.
         DECLFUNC entry_hyperv_tick
 entry_hyperv_tick:
         int $0x08
@@ -839,6 +840,11 @@ entry_hyperv_tick:
         movl $0x40000070, %ecx  // HV_X64_MSR_EOI
         xorl %eax, %eax
         xorl %edx, %edx
+        wrmsr
+        movl $0x400000b1, %ecx  // HV_X64_MSR_STIMER0_COUNT
+        rdmsr
+        addl $549254, %eax      // HYPERV_TICK_PERIOD
+        adcl $0, %edx
         wrmsr
         popl %edx
         popl %ecx

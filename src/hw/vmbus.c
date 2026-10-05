@@ -42,6 +42,7 @@ vmbus_mb(void)
 #define HV_X64_MSR_EOM                  0x40000084
 #define HV_X64_MSR_SINT0                0x40000090
 
+#define HV_SINT_MASKED                  (1 << 16)
 #define HV_SINT_AUTO_EOI                (1 << 17)
 
 // Open source OS, vendor/OS id chosen for SeaBIOS
@@ -384,6 +385,19 @@ vmbus_setup(void)
         return -1;
     }
     return 0;
+}
+
+// Messages are only needed during setup. Mask the message SINT and drop
+// the message page so that an OS VMBus driver can take over (the minimum
+// Windows needs); the rings and the hypercall page stay in use.
+void
+vmbus_quiesce(void)
+{
+    if (!VmbusMsgSlot)
+        return;
+    wrmsr(HV_X64_MSR_SINT0 + VMBUS_MESSAGE_SINT, HV_SINT_MASKED);
+    wrmsr(HV_X64_MSR_SIMP, 0);
+    VmbusMsgSlot = NULL;
 }
 
 // Collect up to max offers of the given interface type.

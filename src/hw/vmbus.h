@@ -22,6 +22,7 @@ struct vmbus_channel {
 };
 
 int vmbus_setup(void);
+void vmbus_quiesce(void);
 int vmbus_find_offers(const u8 *if_type, u32 *relids, u32 *connids, int max);
 int vmbus_open(struct vmbus_channel *chan, u32 relid, u32 connid
                , u32 ring_pages);

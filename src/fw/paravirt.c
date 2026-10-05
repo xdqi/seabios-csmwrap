@@ -95,25 +95,30 @@ static void kvm_detect(void)
 
 #define HV_CPUID_VENDOR_AND_MAX_FUNCTIONS 0x40000000
 #define HV_CPUID_FEATURES                 0x40000003
+#define HV_MSR_TIME_REF_COUNT_AVAILABLE   (1 << 1)
+#define HV_MSR_SYNTIMER_AVAILABLE         (1 << 3)
 #define HV_ACCESS_APIC_MSRS               (1 << 4)
 #define HV_ACCESS_FREQUENCY_MSRS          (1 << 11)
+#define HV_STIMER_DIRECT_MODE_AVAILABLE   (1 << 19)
+#define HV_X64_MSR_TIME_REF_COUNT         0x40000020
 #define HV_X64_MSR_TSC_FREQUENCY          0x40000022
-#define HV_X64_MSR_APIC_FREQUENCY         0x40000023
+#define HV_X64_MSR_STIMER0_CONFIG         0x400000b0
+#define HV_X64_MSR_STIMER0_COUNT          0x400000b1
 
-#define HV_LAPIC_BASE_MSR       0x1b
-#define LAPIC_LVT_TIMER         0x320
-#define LAPIC_TIMER_INITIAL     0x380
-#define LAPIC_TIMER_DIVIDE      0x3e0
-#define LAPIC_LVT_MASKED        (1 << 16)
-#define LAPIC_LVT_PERIODIC      (1 << 17)
-#define LAPIC_DIVIDE_BY_16      0x3
-#define PIT_TICK_RATE           1193182
+#define HV_STIMER_AUTOENABLE    (1 << 3)
+#define HV_STIMER_DIRECT_MODE   (1 << 12)
 
-// IVT vector the LAPIC timer tick is delivered on (see entry_hyperv_tick)
-#define HYPERV_TICK_VECTOR      0xf8
+// One PIT tick (65536 / 1193182 s) in 100ns units of the reference time;
+// entry_hyperv_tick re-arms the timer by this much.
+#define HYPERV_TICK_PERIOD      549254
 
-// LAPIC timer frequency, set when the LAPIC timer tick can replace IRQ0
-u32 HyperVApicHz VARFSEG;
+// IVT vector of the tick (see entry_hyperv_tick). It is an ordinary device
+// vector for Linux and Windows, so a last tick that fires after an OS took
+// over is dismissed harmlessly.
+#define HYPERV_TICK_VECTOR      0x7d
+
+// Set when the synthetic timer tick can replace IRQ0
+u8 HyperVTick VARFSEG;
 
 /* Hyper-V Generation 2 VMs have no PIT, so the TSC cannot be calibrated
  * against it. Use the TSC frequency the hypervisor reports instead.
@@ -133,48 +138,38 @@ static void hyperv_detect(void)
     PlatformRunningOn |= PF_HYPERV;
 
     cpuid(HV_CPUID_FEATURES, &eax, &ebx, &ecx, &edx);
-    if (!(eax & HV_ACCESS_FREQUENCY_MSRS))
-        return;
+    if (eax & HV_ACCESS_FREQUENCY_MSRS) {
+        // hz / 1000 without a 64-bit division: 1000 == 8 * 125.
+        u64 hz = rdmsr(HV_X64_MSR_TSC_FREQUENCY);
+        u32 khz = (u32)(hz >> 3) / 125;
+        dprintf(1, "hyperv: tsc freq %u kHz\n", khz);
+        tsctimer_setfreq(khz, "hyperv");
+    }
 
-    // hz / 1000 without a 64-bit division: 1000 == 8 * 125.
-    u64 hz = rdmsr(HV_X64_MSR_TSC_FREQUENCY);
-    u32 khz = (u32)(hz >> 3) / 125;
-    dprintf(1, "hyperv: tsc freq %u kHz\n", khz);
-    tsctimer_setfreq(khz, "hyperv");
-
-    // The tick handler EOIs through the synthetic EOI MSR.
-    if (eax & HV_ACCESS_APIC_MSRS)
-        HyperVApicHz = rdmsr(HV_X64_MSR_APIC_FREQUENCY);
+    // The tick handler re-arms the timer and EOIs through MSRs.
+    u32 need = HV_MSR_TIME_REF_COUNT_AVAILABLE | HV_MSR_SYNTIMER_AVAILABLE
+               | HV_ACCESS_APIC_MSRS;
+    if ((eax & need) == need && (edx & HV_STIMER_DIRECT_MODE_AVAILABLE))
+        HyperVTick = 1;
 }
 
 /* Without a PIT nothing raises IRQ0, so BDA ticks never advance and
- * every hlt-based wait hangs. Run the LAPIC timer at the PIT rate instead;
- * entry_hyperv_tick chains to the IRQ0 vector.
+ * every hlt-based wait hangs. Use a one-shot synthetic timer in direct
+ * mode instead; entry_hyperv_tick chains to the IRQ0 vector and re-arms
+ * it. Once an OS owns the interrupts the handler stops running, so the
+ * tick dies out by itself instead of firing into the OS.
  */
 void hyperv_tick_setup(void)
 {
-    if (!HyperVApicHz || pit_present())
+    if (!HyperVTick || pit_present())
         return;
-
-    // count = (apic_hz / 16) * 65536 / PIT_TICK_RATE, in 32-bit steps
-    u32 q = HyperVApicHz / 16;
-    u32 r = q % PIT_TICK_RATE;
-    u32 count = (q / PIT_TICK_RATE) * 65536;
-    r *= 256;
-    count += (r / PIT_TICK_RATE) * 256;
-    r = (r % PIT_TICK_RATE) * 256;
-    count += r / PIT_TICK_RATE;
-
     SET_IVT(HYPERV_TICK_VECTOR, FUNC16(entry_hyperv_tick));
-
-    u32 lapic = (u32)rdmsr(HV_LAPIC_BASE_MSR) & 0xfffff000;
-    writel((void *)(lapic + LAPIC_LVT_TIMER), LAPIC_LVT_MASKED);
-    writel((void *)(lapic + LAPIC_TIMER_DIVIDE), LAPIC_DIVIDE_BY_16);
-    writel((void *)(lapic + LAPIC_LVT_TIMER),
-           HYPERV_TICK_VECTOR | LAPIC_LVT_PERIODIC);
-    writel((void *)(lapic + LAPIC_TIMER_INITIAL), count);
-    dprintf(1, "hyperv: LAPIC timer tick on vector 0x%x (count %u)\n",
-            HYPERV_TICK_VECTOR, count);
+    wrmsr(HV_X64_MSR_STIMER0_CONFIG, HV_STIMER_AUTOENABLE
+          | HV_STIMER_DIRECT_MODE | (HYPERV_TICK_VECTOR << 4));
+    wrmsr(HV_X64_MSR_STIMER0_COUNT
+          , rdmsr(HV_X64_MSR_TIME_REF_COUNT) + HYPERV_TICK_PERIOD);
+    dprintf(1, "hyperv: synthetic timer tick on vector 0x%x\n"
+            , HYPERV_TICK_VECTOR);
 }
 
 #define KVM_FEATURE_CLOCKSOURCE           0
