@@ -130,6 +130,7 @@ static void hyperv_detect(void)
     signature[12] = 0;
     if (strcmp(signature, "Microsoft Hv") != 0 || eax < HV_CPUID_FEATURES)
         return;
+    PlatformRunningOn |= PF_HYPERV;
 
     cpuid(HV_CPUID_FEATURES, &eax, &ebx, &ecx, &edx);
     if (!(eax & HV_ACCESS_FREQUENCY_MSRS))

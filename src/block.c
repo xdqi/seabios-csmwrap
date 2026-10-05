@@ -15,6 +15,7 @@
 #include "hw/mpt-scsi.h" // mpt_scsi_process_op
 #include "hw/pci.h" // pci_bdf_to_bus
 #include "hw/pvscsi.h" // pvscsi_process_op
+#include "hw/storvsc.h" // storvsc_process_op
 #include "hw/rtc.h" // rtc_read
 #include "hw/usb-msc.h" // usb_process_op
 #include "hw/usb-uas.h" // uas_process_op
@@ -520,6 +521,7 @@ block_setup(void)
     megasas_setup();
     pvscsi_setup();
     mpt_scsi_setup();
+    storvsc_setup();
     nvme_setup();
 }
 
@@ -664,6 +666,8 @@ process_op_32(struct disk_op_s *op)
         return virtio_scsi_process_op(op);
     case DTYPE_PVSCSI:
         return pvscsi_process_op(op);
+    case DTYPE_STORVSC:
+        return storvsc_process_op(op);
     case DTYPE_NVME:
         return nvme_process_op(op);
     default:

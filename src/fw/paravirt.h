@@ -21,6 +21,7 @@ struct pvclock_vcpu_time_info {
 #define PF_QEMU     (1<<0)
 #define PF_XEN      (1<<1)
 #define PF_KVM      (1<<2)
+#define PF_HYPERV   (1<<3)
 
 typedef struct QemuCfgDmaAccess {
     u32 control;
@@ -43,6 +44,9 @@ static inline int runningOnXen(void) {
 }
 static inline int runningOnKVM(void) {
     return CONFIG_QEMU && GET_GLOBAL(PlatformRunningOn) & PF_KVM;
+}
+static inline int runningOnHyperV(void) {
+    return GET_GLOBAL(PlatformRunningOn) & PF_HYPERV;
 }
 
 // Common paravirt ports.
