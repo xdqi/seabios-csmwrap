@@ -9,7 +9,7 @@
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "biosvar.h" // SET_IVT
-#include "config.h" // CONFIG_HYPERV_STORVSC
+#include "config.h" // CONFIG_HYPERV_VMBUS
 #include "fw/paravirt.h" // runningOnHyperV
 #include "malloc.h" // memalign_high
 #include "memmap.h" // PAGE_SIZE
@@ -200,6 +200,14 @@ static struct hv_message *VmbusMsgSlot;
 static struct hv_post_message_input *VmbusPostInput;
 static u32 VmbusVpIndex, VmbusNextGpadl = 0xe1e10;
 
+#define VMBUS_MAX_OFFERS 32
+static struct {
+    u8 if_type[16];
+    u32 relid;
+    u32 connid;
+} VmbusOffers[VMBUS_MAX_OFFERS];
+static int VmbusOfferCount;
+
 
 /****************************************************************
  * Hypercalls and SynIC messages
@@ -340,11 +348,41 @@ vmbus_connect(void)
     return -1;
 }
 
+// Ask the host for all channel offers and remember them.
+static void
+vmbus_request_offers(void)
+{
+    struct vmbus_msg_header req = { .msgtype = CHANNELMSG_REQUESTOFFERS };
+    if (vmbus_post(&req, sizeof(req)))
+        return;
+    for (;;) {
+        u8 buf[HV_MESSAGE_PAYLOAD_SIZE];
+        int t = vmbus_wait_msg(buf, 5000);
+        if (t < 0) {
+            dprintf(1, "vmbus: timeout waiting for offers\n");
+            return;
+        }
+        if (t == CHANNELMSG_ALLOFFERS_DELIVERED)
+            return;
+        if (t != CHANNELMSG_OFFERCHANNEL
+            || VmbusOfferCount >= ARRAY_SIZE(VmbusOffers))
+            continue;
+        struct vmbus_offer_channel *offer = (void *)buf;
+        dprintf(3, "vmbus: offer relid %d conn %x type %08x\n"
+                , offer->child_relid, offer->connection_id
+                , *(u32 *)offer->if_type);
+        memcpy(VmbusOffers[VmbusOfferCount].if_type, offer->if_type, 16);
+        VmbusOffers[VmbusOfferCount].relid = offer->child_relid;
+        VmbusOffers[VmbusOfferCount].connid = offer->connection_id;
+        VmbusOfferCount++;
+    }
+}
+
 int
 vmbus_setup(void)
 {
     ASSERT32FLAT();
-    if (!CONFIG_HYPERV_STORVSC || !runningOnHyperV())
+    if (!CONFIG_HYPERV_VMBUS || !runningOnHyperV())
         return -1;
     if (VmbusHypercallPage)
         return 0;
@@ -384,6 +422,7 @@ vmbus_setup(void)
         VmbusHypercallPage = 0;
         return -1;
     }
+    vmbus_request_offers();
     return 0;
 }
 
@@ -404,31 +443,15 @@ vmbus_quiesce(void)
 int
 vmbus_find_offers(const u8 *if_type, u32 *relids, u32 *connids, int max)
 {
-    struct vmbus_msg_header req = { .msgtype = CHANNELMSG_REQUESTOFFERS };
-    if (vmbus_post(&req, sizeof(req)))
-        return -1;
-    int count = 0;
-    for (;;) {
-        u8 buf[HV_MESSAGE_PAYLOAD_SIZE];
-        int t = vmbus_wait_msg(buf, 5000);
-        if (t < 0) {
-            dprintf(1, "vmbus: timeout waiting for offers\n");
-            return count;
-        }
-        if (t == CHANNELMSG_ALLOFFERS_DELIVERED)
-            return count;
-        if (t != CHANNELMSG_OFFERCHANNEL)
+    int i, count = 0;
+    for (i = 0; i < VmbusOfferCount && count < max; i++) {
+        if (memcmp(VmbusOffers[i].if_type, if_type, 16) != 0)
             continue;
-        struct vmbus_offer_channel *offer = (void *)buf;
-        dprintf(3, "vmbus: offer relid %d conn %x type %08x\n"
-                , offer->child_relid, offer->connection_id
-                , *(u32 *)offer->if_type);
-        if (count < max && memcmp(offer->if_type, if_type, 16) == 0) {
-            relids[count] = offer->child_relid;
-            connids[count] = offer->connection_id;
-            count++;
-        }
+        relids[count] = VmbusOffers[i].relid;
+        connids[count] = VmbusOffers[i].connid;
+        count++;
     }
+    return count;
 }
 
 // Open a channel whose two rings (ring_pages each, header page included)

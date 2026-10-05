@@ -197,14 +197,27 @@ menu "Hardware support"
             booting directly from images imported from an ESX platform,
             without the need to use slower emulation of storage controllers
             such as IDE.
+    config HYPERV_VMBUS
+        bool "Hyper-V VMBus devices"
+        default y
+        help
+            Support synthetic devices attached over VMBus, which are all
+            the storage and input devices of Hyper-V Generation 2 VMs.
     config HYPERV_STORVSC
-        depends on DRIVES
+        depends on DRIVES && HYPERV_VMBUS
         bool "Hyper-V synthetic SCSI controllers"
         default y
         help
             Support boot from disks on the Hyper-V synthetic SCSI controller,
             which is attached over VMBus. This is the only boot storage in
             Hyper-V Generation 2 VMs.
+    config HYPERV_KEYBOARD
+        depends on KEYBOARD && HYPERV_VMBUS
+        bool "Hyper-V synthetic keyboards"
+        default y
+        help
+            Support the Hyper-V synthetic keyboard, which is the only keyboard
+            in Hyper-V Generation 2 VMs.
     config ESP_SCSI
         depends on DRIVES && QEMU_HARDWARE
         bool "AMD PCscsi controllers"

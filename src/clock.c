@@ -8,6 +8,7 @@
 #include "biosvar.h" // SET_BDA
 #include "bregs.h" // struct bregs
 #include "fw/paravirt.h" // hyperv_tick_setup
+#include "hw/hvkbd.h" // hvkbd_check_event
 #include "hw/pic.h" // pic_eoi1
 #include "hw/ps2port.h" // ps2_check_event
 #include "hw/rtc.h" // rtc_read
@@ -297,6 +298,7 @@ clock_update(void)
     floppy_tick();
     usb_check_event();
     ps2_check_event();
+    hvkbd_check_event();
     sercon_check_event();
 }
 

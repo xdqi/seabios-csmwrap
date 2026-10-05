@@ -336,5 +336,4 @@ storvsc_setup(void)
     int i;
     for (i = 0; i < count; i++)
         storvsc_init_ctl(relids[i], connids[i]);
-    vmbus_quiesce();
 }

@@ -12,11 +12,13 @@
 #include "e820map.h" // e820_add
 #include "fw/paravirt.h" // qemu_cfg_preinit
 #include "fw/xen.h" // xen_preinit
+#include "hw/hvkbd.h" // hvkbd_setup
 #include "hw/pic.h" // pic_setup
 #include "hw/ps2port.h" // ps2port_setup
 #include "hw/rtc.h" // rtc_write
 #include "hw/serialio.h" // serial_debug_preinit
 #include "hw/usb.h" // usb_setup
+#include "hw/vmbus.h" // vmbus_quiesce
 #include "malloc.h" // malloc_init
 #include "memmap.h" // SYMBOL
 #include "output.h" // dprintf
@@ -128,10 +130,12 @@ device_hardware_setup(void)
 {
     usb_setup();
     ps2port_setup();
+    hvkbd_setup();
     block_setup();
     lpt_setup();
     serial_setup();
     cbfs_payload_setup();
+    vmbus_quiesce();
 }
 
 static void
