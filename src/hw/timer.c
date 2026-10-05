@@ -270,6 +270,19 @@ ticks_from_ms(u32 ms)
     return DIV_ROUND_UP(t, 1000 * PMTIMER_TO_PIT);
 }
 
+// A missing PIT (e.g. Hyper-V Generation 2 VMs) leaves the bus floating,
+// so both port 0x61 and a latched counter 0 read back as all ones.
+int
+pit_present(void)
+{
+    if (inb(PORT_PS2_CTRLB) != 0xff)
+        return 1;
+    outb(PM_SEL_TIMER0|PM_ACCESS_LATCH, PORT_PIT_MODE);
+    u8 lo = inb(PORT_PIT_COUNTER0);
+    u8 hi = inb(PORT_PIT_COUNTER0);
+    return lo != 0xff || hi != 0xff;
+}
+
 void
 pit_setup(void)
 {

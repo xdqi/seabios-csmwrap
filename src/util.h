@@ -199,6 +199,7 @@ void usleep(u32 count);
 void msleep(u32 count);
 u32 ticks_to_ms(u32 ticks);
 u32 ticks_from_ms(u32 ms);
+int pit_present(void);
 void pit_setup(void);
 
 // jpeg.c

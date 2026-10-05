@@ -69,6 +69,7 @@ static inline int runningOnKVM(void) {
 int qemu_cfg_enabled(void);
 int qemu_cfg_dma_enabled(void);
 void qemu_preinit(void);
+void hyperv_tick_setup(void);
 void qemu_platform_setup(void);
 void qemu_cfg_init(void);
 

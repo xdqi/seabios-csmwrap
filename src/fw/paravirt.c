@@ -8,6 +8,7 @@
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
+#include "biosvar.h" // SET_IVT
 #include "byteorder.h" // be32_to_cpu
 #include "config.h" // CONFIG_QEMU
 #include "e820map.h" // e820_add
@@ -90,6 +91,89 @@ static void kvm_detect(void)
             tsctimer_setfreq(eax, "invtsc");
         }
     }
+}
+
+#define HV_CPUID_VENDOR_AND_MAX_FUNCTIONS 0x40000000
+#define HV_CPUID_FEATURES                 0x40000003
+#define HV_ACCESS_APIC_MSRS               (1 << 4)
+#define HV_ACCESS_FREQUENCY_MSRS          (1 << 11)
+#define HV_X64_MSR_TSC_FREQUENCY          0x40000022
+#define HV_X64_MSR_APIC_FREQUENCY         0x40000023
+
+#define HV_LAPIC_BASE_MSR       0x1b
+#define LAPIC_LVT_TIMER         0x320
+#define LAPIC_TIMER_INITIAL     0x380
+#define LAPIC_TIMER_DIVIDE      0x3e0
+#define LAPIC_LVT_MASKED        (1 << 16)
+#define LAPIC_LVT_PERIODIC      (1 << 17)
+#define LAPIC_DIVIDE_BY_16      0x3
+#define PIT_TICK_RATE           1193182
+
+// IVT vector the LAPIC timer tick is delivered on (see entry_hyperv_tick)
+#define HYPERV_TICK_VECTOR      0xf8
+
+// LAPIC timer frequency, set when the LAPIC timer tick can replace IRQ0
+u32 HyperVApicHz VARFSEG;
+
+/* Hyper-V Generation 2 VMs have no PIT, so the TSC cannot be calibrated
+ * against it. Use the TSC frequency the hypervisor reports instead.
+ */
+static void hyperv_detect(void)
+{
+    unsigned int eax, ebx, ecx, edx;
+    char signature[13];
+
+    cpuid(HV_CPUID_VENDOR_AND_MAX_FUNCTIONS, &eax, &ebx, &ecx, &edx);
+    memcpy(signature + 0, &ebx, 4);
+    memcpy(signature + 4, &ecx, 4);
+    memcpy(signature + 8, &edx, 4);
+    signature[12] = 0;
+    if (strcmp(signature, "Microsoft Hv") != 0 || eax < HV_CPUID_FEATURES)
+        return;
+
+    cpuid(HV_CPUID_FEATURES, &eax, &ebx, &ecx, &edx);
+    if (!(eax & HV_ACCESS_FREQUENCY_MSRS))
+        return;
+
+    // hz / 1000 without a 64-bit division: 1000 == 8 * 125.
+    u64 hz = rdmsr(HV_X64_MSR_TSC_FREQUENCY);
+    u32 khz = (u32)(hz >> 3) / 125;
+    dprintf(1, "hyperv: tsc freq %u kHz\n", khz);
+    tsctimer_setfreq(khz, "hyperv");
+
+    // The tick handler EOIs through the synthetic EOI MSR.
+    if (eax & HV_ACCESS_APIC_MSRS)
+        HyperVApicHz = rdmsr(HV_X64_MSR_APIC_FREQUENCY);
+}
+
+/* Without a PIT nothing raises IRQ0, so BDA ticks never advance and
+ * every hlt-based wait hangs. Run the LAPIC timer at the PIT rate instead;
+ * entry_hyperv_tick chains to the IRQ0 vector.
+ */
+void hyperv_tick_setup(void)
+{
+    if (!HyperVApicHz || pit_present())
+        return;
+
+    // count = (apic_hz / 16) * 65536 / PIT_TICK_RATE, in 32-bit steps
+    u32 q = HyperVApicHz / 16;
+    u32 r = q % PIT_TICK_RATE;
+    u32 count = (q / PIT_TICK_RATE) * 65536;
+    r *= 256;
+    count += (r / PIT_TICK_RATE) * 256;
+    r = (r % PIT_TICK_RATE) * 256;
+    count += r / PIT_TICK_RATE;
+
+    SET_IVT(HYPERV_TICK_VECTOR, FUNC16(entry_hyperv_tick));
+
+    u32 lapic = (u32)rdmsr(HV_LAPIC_BASE_MSR) & 0xfffff000;
+    writel((void *)(lapic + LAPIC_LVT_TIMER), LAPIC_LVT_MASKED);
+    writel((void *)(lapic + LAPIC_TIMER_DIVIDE), LAPIC_DIVIDE_BY_16);
+    writel((void *)(lapic + LAPIC_LVT_TIMER),
+           HYPERV_TICK_VECTOR | LAPIC_LVT_PERIODIC);
+    writel((void *)(lapic + LAPIC_TIMER_INITIAL), count);
+    dprintf(1, "hyperv: LAPIC timer tick on vector 0x%x (count %u)\n",
+            HYPERV_TICK_VECTOR, count);
 }
 
 #define KVM_FEATURE_CLOCKSOURCE           0
@@ -228,6 +312,7 @@ qemu_preinit(void)
 {
     qemu_detect();
     kvm_detect();
+    hyperv_detect();
 
     if (!CONFIG_QEMU)
         return;

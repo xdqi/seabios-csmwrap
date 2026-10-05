@@ -7,6 +7,7 @@
 
 #include "biosvar.h" // SET_BDA
 #include "bregs.h" // struct bregs
+#include "fw/paravirt.h" // hyperv_tick_setup
 #include "hw/pic.h" // pic_eoi1
 #include "hw/ps2port.h" // ps2_check_event
 #include "hw/rtc.h" // rtc_read
@@ -58,6 +59,7 @@ clock_setup(void)
     enable_hwirq(0, FUNC16(entry_08));
     if (CONFIG_RTC_TIMER)
         enable_hwirq(8, FUNC16(entry_70));
+    hyperv_tick_setup();
 }
 
 
