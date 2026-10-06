@@ -63,6 +63,12 @@ pic_setup(void)
 {
     dprintf(3, "init pic\n");
     pic_reset(BIOS_HWIRQ0_VECTOR, BIOS_HWIRQ8_VECTOR);
+    // A missing PIC (e.g. Hyper-V Generation 2 VMs) leaves the bus floating,
+    // so the mask just written reads back as all ones.
+    if (inb(PORT_PIC1_DATA) == 0xff) {
+        dprintf(1, "No PIC: vector 0x0d handles #GP with flat real mode\n");
+        SET_IVT(BIOS_HWIRQ0_VECTOR + 5, FUNC16(entry_flatreal));
+    }
 }
 
 void

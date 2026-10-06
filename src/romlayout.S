@@ -859,6 +859,47 @@ entry_hyperv_tick:
         popl %eax
         iretw
 
+        // Without a PIC the IRQ 5 vector (0x0d) is only reached by #GP.
+        // Real-mode code that uses 32-bit offsets (HIMEM's block move) hooks
+        // it to switch to flat real mode, but tells #GP from IRQ 5 by the PIC
+        // ISR, which reads 0xff when there is no PIC, and so chains here.  Do
+        // what it would have done: give %ds/%es/%fs/%gs 4 GiB limits and
+        // return to restart the faulting instruction.
+        DECLFUNC entry_flatreal
+entry_flatreal:
+        pushl %eax
+        pushw %bp
+        pushw %ds
+        pushw %es
+        pushw %fs
+        pushw %gs
+        subw $6, %sp
+        movw %sp, %bp
+        sgdtw (%bp)             // Keep the caller's GDTR
+        lgdtw %cs:rombios32_gdt_48
+        movl %cr0, %eax
+        orl $CR0_PE, %eax
+        movl %eax, %cr0
+        ljmpw $SEG32_MODE16_CS, $1f
+1:      movw $SEG32_MODE16BIG_DS, %ax
+        movw %ax, %ds
+        movw %ax, %es
+        movw %ax, %fs
+        movw %ax, %gs
+        movl %cr0, %eax
+        andl $~CR0_PE, %eax
+        movl %eax, %cr0
+        ljmpw $SEG_BIOS, $2f
+2:      lgdtw (%bp)
+        addw $6, %sp
+        popw %gs                // Real-mode loads keep the 4 GiB limits
+        popw %fs
+        popw %es
+        popw %ds
+        popw %bp
+        popl %eax
+        iretw
+
         // int 18/19 are special - they reset stack and call into 32bit mode.
         DECLFUNC entry_19
 entry_19:
