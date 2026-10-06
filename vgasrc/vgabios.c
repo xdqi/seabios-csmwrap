@@ -136,7 +136,7 @@ set_active_page(u8 page)
 static void
 set_character_height(u8 lines)
 {
-    // Text modes kept in RAM (cbvga_textscan_mode) have 400 scan lines.
+    // Text modes kept in RAM (cbvga_scanout_memmodel) have 400 scan lines.
     u16 vertical_size = 400;
     if (CONFIG_VGA_STDVGA_PORTS) {
         stdvga_set_character_height(lines);
@@ -305,7 +305,7 @@ vga_set_mode(int mode, int flags)
     u16 crtc_addr = 0;
     if (CONFIG_VGA_STDVGA_PORTS)
         crtc_addr = stdvga_get_crtc();
-    else if (cbvga_textscan_mode())
+    else if (cbvga_scanout_memmodel() >= 0)
         crtc_addr = mode == 0x07 ? VGAREG_MDA_CRTC_ADDRESS
                                  : VGAREG_VGA_CRTC_ADDRESS;
     SET_BDA(crtc_address, crtc_addr);
@@ -861,7 +861,7 @@ handle_1011(struct bregs *regs)
         case 0x12: handle_101112(regs); return;
         case 0x14: handle_101114(regs); return;
         }
-    } else if (cbvga_textscan_mode()) {
+    } else if (cbvga_scanout_memmodel() == MM_TEXT) {
         // The BIOS draws these modes with its own fonts.
         switch (regs->al) {
         case 0x11: set_character_height(14); return;

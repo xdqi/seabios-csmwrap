@@ -24,12 +24,23 @@ static u32 CBlinelength VAR16;
 
 // Without VGA hardware the standard text modes are kept in the legacy text
 // buffer, which the BIOS draws on the framebuffer (see src/textscan.c).
-static u8 CBtextscan VAR16;
-static struct vgamode_s CBtextmodes[] VAR16 = {
+// Optionally mode 12h is approximated the same way with a single bit plane
+// at 0xa0000, losing its colors.
+static u8 CBtextscan VAR16, CBplanar VAR16;
+static struct vgamode_s CBscanmodes[] VAR16 = {
     { MM_TEXT, 40, 25, 4, 8, 16, SEG_CTEXT }, // modes 0 and 1
     { MM_TEXT, 80, 25, 4, 8, 16, SEG_CTEXT }, // modes 2 and 3
     { MM_TEXT, 80, 25, 4, 8, 16, SEG_MTEXT }, // mode 7
+    { MM_PLANAR, 640, 480, 4, 8, 16, SEG_GRAPH }, // mode 12h
 };
+static u8 CBscanmodenum[] VAR16 = { 0x01, 0x03, 0x07, 0x12 };
+
+static int
+cbvga_is_scanmode(struct vgamode_s *vmode_g)
+{
+    return CONFIG_VGA_TEXT_SCANOUT && vmode_g >= CBscanmodes
+        && vmode_g < &CBscanmodes[ARRAY_SIZE(CBscanmodes)];
+}
 
 struct vgamode_s *cbvga_find_mode(int mode)
 {
@@ -37,7 +48,9 @@ struct vgamode_s *cbvga_find_mode(int mode)
         return &CBmodeinfo;
     if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan)
         && (mode <= 0x03 || mode == 0x07))
-        return &CBtextmodes[mode == 0x07 ? 2 : mode / 2];
+        return &CBscanmodes[mode == 0x07 ? 2 : mode / 2];
+    if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBplanar) && mode == 0x12)
+        return &CBscanmodes[3];
     if (mode == 0x03)
         return &CBemulinfo;
 
@@ -105,6 +118,8 @@ cbvga_minimum_linelength(struct vgamode_s *vmode_g)
 int
 cbvga_get_linelength(struct vgamode_s *curmode_g)
 {
+    if (CONFIG_VGA_TEXT_SCANOUT && curmode_g == &CBscanmodes[3])
+        return 640 / 8;
     return GET_GLOBAL(CBlinelength);
 }
 
@@ -153,13 +168,15 @@ cbvga_scanout_set(u8 mode)
     SET_FARVAR(SCANOUT_SEG, so->state, SCANOUT_STATE(mode, gen));
 }
 
-// Check whether the current mode is a text mode kept in RAM.
+// Return the memory model of the current mode if it is kept in RAM and
+// drawn by the BIOS (see src/textscan.c), else -1.
 int
-cbvga_textscan_mode(void)
+cbvga_scanout_memmodel(void)
 {
     struct vgamode_s *curmode_g = get_current_mode();
-    return CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan) && curmode_g
-        && GET_GLOBAL(curmode_g->memmodel) == MM_TEXT;
+    if (!cbvga_is_scanmode(curmode_g))
+        return -1;
+    return GET_GLOBAL(curmode_g->memmodel);
 }
 
 int
@@ -187,14 +204,16 @@ cbvga_set_mode(struct vgamode_s *vmode_g, int flags)
      */
     u8 extra_stack = GET_BDA_EXT(flags) & BF_EXTRA_STACK;
     MASK_BDA_EXT(flags, BF_EMULATE_TEXT, emul ? BF_EMULATE_TEXT : 0);
-    if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan)
-        && GET_GLOBAL(vmode_g->memmodel) == MM_TEXT) {
-        if (!(flags & MF_NOCLEARMEM))
-            memset16_far(GET_GLOBAL(vmode_g->sstart), (void*)0, 0x0720
-                         , 32*1024);
+    if (cbvga_is_scanmode(vmode_g)) {
+        if (!(flags & MF_NOCLEARMEM)) {
+            if (GET_GLOBAL(vmode_g->memmodel) == MM_TEXT)
+                memset16_far(GET_GLOBAL(vmode_g->sstart), (void*)0, 0x0720
+                             , 32*1024);
+            else
+                memset_far(SEG_GRAPH, (void*)0, 0, 640 * 480 / 8);
+        }
         // Have the BIOS draw the mode (and the whole screen again).
-        cbvga_scanout_set(vmode_g == &CBtextmodes[2] ? 0x07
-                          : vmode_g == &CBtextmodes[1] ? 0x03 : 0x01);
+        cbvga_scanout_set(GET_GLOBAL(CBscanmodenum[vmode_g - CBscanmodes]));
         return 0;
     }
     if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan))
@@ -236,6 +255,15 @@ struct cb_framebuffer {
     u8 blue_mask_size;
     u8 reserved_mask_pos;
     u8 reserved_mask_size;
+};
+
+// CSMWrap private record with video options
+#define CB_TAG_CSMWRAP_VIDEO    0x43534d57
+#define CB_CSMWRAP_VIDEO_PLANAR_APPROX 0x01
+struct cb_csmwrap_video {
+    u32 tag;
+    u32 size;
+    u32 flags;
 };
 
 void
@@ -349,11 +377,19 @@ cbvga_setup(void)
 
     cbvga_setup_modes(addr, bpp, xlines, ylines, linelength);
 
-    if (CONFIG_VGA_TEXT_SCANOUT && bpp == 32 && xlines >= 80*8
-        && ylines >= 25*16 && !cbvga_vga_present()
-        && cbvga_is_ram(SEG_CTEXT) && cbvga_is_ram(SEG_MTEXT)) {
-        dprintf(1, "No VGA hardware - keeping text modes in RAM\n");
-        SET_VGA(CBtextscan, 1);
+    if (!CONFIG_VGA_TEXT_SCANOUT || bpp != 32 || xlines < 80*8
+        || ylines < 25*16 || cbvga_vga_present()
+        || !cbvga_is_ram(SEG_CTEXT) || !cbvga_is_ram(SEG_MTEXT))
+        return 0;
+    dprintf(1, "No VGA hardware - keeping text modes in RAM\n");
+    SET_VGA(CBtextscan, 1);
+
+    struct cb_csmwrap_video *cbvid = find_cb_subtable(cbh
+                                                      , CB_TAG_CSMWRAP_VIDEO);
+    if (cbvid && GET_FARVAR(0, cbvid->flags) & CB_CSMWRAP_VIDEO_PLANAR_APPROX
+        && ylines >= 480 && cbvga_is_ram(SEG_GRAPH)) {
+        dprintf(1, "Approximating mode 12h with one plane in RAM\n");
+        SET_VGA(CBplanar, 1);
     }
     return 0;
 }

@@ -11,6 +11,11 @@
 // which mode is set through video memory (see textscan.h), as the BDA is
 // not updated when Windows XP's VideoPortInt10 sets a mode.
 //
+// If enabled, mode 12h (640x480, 16 colors) is approximated the same way:
+// its four bit planes collapse into the RAM at 0xa0000, which is shown as
+// a monochrome bitmap. That is enough for the text that the Far East
+// versions of NTLDR and SETUPLDR draw in that mode.
+//
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "biosvar.h" // GET_BDA
@@ -45,6 +50,12 @@ struct cb_framebuffer {
 
 #define TEXTSCAN_MAX_CELLS      (80*50)
 #define TEXTSCAN_INTERVAL_MS    20
+#define PLANAR_WIDTH            640
+#define PLANAR_HEIGHT           480
+#define PLANAR_BYTES            (PLANAR_WIDTH * PLANAR_HEIGHT / 8)
+// Colors of the set and clear bits of mode 12h, those of Windows Setup
+#define PLANAR_FG               15 // white
+#define PLANAR_BG               1  // blue
 
 struct textscan_s {
     u8 *fb;
@@ -56,7 +67,10 @@ struct textscan_s {
     u32 state;                  // scan-out state drawn (see textscan.h)
     int cursor;                 // cell with the cursor drawn, -1 if none
     u16 cursor_lines;
-    u16 shadow[TEXTSCAN_MAX_CELLS]; // cells on screen
+    union {                     // contents on screen
+        u16 cells[TEXTSCAN_MAX_CELLS];
+        u8 bits[PLANAR_BYTES];
+    } shadow;
 };
 
 struct textscan_s *TextScan VARFSEG;
@@ -93,7 +107,8 @@ static int
 textscan_mode(u32 state)
 {
     u8 mode = state;
-    return SCANOUT_STATE_VALID(state) && (mode <= 0x03 || mode == 0x07);
+    return SCANOUT_STATE_VALID(state)
+        && (mode <= 0x03 || mode == 0x07 || mode == 0x12);
 }
 
 // Get a font of SeaVGABIOS.
@@ -173,37 +188,41 @@ textscan_fill(struct textscan_s *ts, u32 x, u32 y, u32 w, u32 h)
     }
 }
 
+// Draw the bits of the mode 12h plane that changed since the last call.
+static void
+textscan_draw_planar(struct textscan_s *ts, u8 *dest, int full, u32 state)
+{
+    u8 *bits = (void*)0xa0000;
+    u32 fg = ts->palette[PLANAR_FG], bg = ts->palette[PLANAR_BG];
+    u32 i;
+    for (i = 0; i < PLANAR_BYTES; i++) {
+        u8 b = bits[i];
+        if (b == ts->shadow.bits[i] && !full)
+            continue;
+        // Stop as soon as the mode is left.
+        if (textscan_state() != state) {
+            ts->layout = 0;
+            return;
+        }
+        ts->shadow.bits[i] = b;
+        u32 *pix = (void*)(dest + i / (PLANAR_WIDTH / 8) * ts->pitch
+                           + i % (PLANAR_WIDTH / 8) * 8 * 4);
+        int k;
+        for (k = 0; k < 8; k++, b <<= 1)
+            pix[k] = b & 0x80 ? fg : bg;
+    }
+}
+
 // Draw the cells of the text buffer that changed since the last call.
 static void
-textscan_draw(struct textscan_s *ts, u32 state)
+textscan_draw_text(struct textscan_s *ts, u8 *dest, int full, u32 state)
 {
     u8 mode = state;
     u32 cols = GET_BDA(video_cols), rows = GET_BDA(video_rows) + 1;
     u32 cheight = GET_BDA(char_height), cwidth = cols <= 40 ? 16 : 8;
-    u32 width = cols * cwidth, height = rows * cheight;
     u16 *text = (void*)(mode == 7 ? 0xb0000 : 0xb8000)
         + GET_BDA(video_pagestart);
     u8 *font = ts->font[cheight == 8 ? 0 : cheight == 14 ? 2 : 3];
-    if ((cheight != 8 && cheight != 14 && cheight != 16)
-        || cols * rows > TEXTSCAN_MAX_CELLS || width > ts->xres
-        || height > ts->yres || (void*)&text[cols * rows] > (void*)0xc0000) {
-        ts->layout = 0;
-        return;
-    }
-    u32 xoff = (ts->xres - width) / 2, yoff = (ts->yres - height) / 2;
-
-    // Redraw everything after a mode set.
-    u32 layout = cols << 16 | rows << 8 | cheight;
-    int full = layout != ts->layout || state != ts->state;
-    if (full) {
-        ts->layout = layout;
-        ts->state = state;
-        textscan_fill(ts, 0, 0, ts->xres, yoff);
-        textscan_fill(ts, 0, yoff + height, ts->xres
-                      , ts->yres - yoff - height);
-        textscan_fill(ts, 0, yoff, xoff, height);
-        textscan_fill(ts, xoff + width, yoff, ts->xres - xoff - width, height);
-    }
 
     // Find the cursor and its scan lines (emulating CGA cursor shapes
     // like SeaVGABIOS does for the VGA CRTC).
@@ -229,19 +248,19 @@ textscan_draw(struct textscan_s *ts, u32 state)
         oldcursor = cursor = -1;
     }
 
-    u8 *dest = ts->fb + yoff * ts->pitch + xoff * 4;
     u32 x, y, i = 0;
     for (y = 0; y < rows; y++, dest += cheight * ts->pitch) {
         for (x = 0; x < cols; x++, i++) {
             u16 cell = text[i];
-            if (cell == ts->shadow[i] && !full && i != cursor && i != oldcursor)
+            if (cell == ts->shadow.cells[i] && !full && i != cursor
+                && i != oldcursor)
                 continue;
             // Stop as soon as the text mode is left.
             if (textscan_state() != state) {
                 ts->layout = 0;
                 return;
             }
-            ts->shadow[i] = cell;
+            ts->shadow.cells[i] = cell;
             u8 c = cell, *glyph = font + c * cheight;
             if (cheight == 8 && c >= 128)
                 glyph = ts->font[1] + (c - 128) * 8;
@@ -266,8 +285,53 @@ textscan_draw(struct textscan_s *ts, u32 state)
     }
 }
 
+// Draw what changed on the screen since the last call.
+static void
+textscan_draw(struct textscan_s *ts, u32 state)
+{
+    u8 mode = state;
+    u32 width = PLANAR_WIDTH, height = PLANAR_HEIGHT, layout = 1;
+    if (mode != 0x12) {
+        u32 cols = GET_BDA(video_cols), rows = GET_BDA(video_rows) + 1;
+        u32 cheight = GET_BDA(char_height);
+        width = cols * (cols <= 40 ? 16 : 8);
+        height = rows * cheight;
+        layout = cols << 16 | rows << 8 | cheight;
+        void *end = (void*)(mode == 7 ? 0xb0000 : 0xb8000)
+            + GET_BDA(video_pagestart) + cols * rows * 2;
+        if ((cheight != 8 && cheight != 14 && cheight != 16)
+            || cols * rows > TEXTSCAN_MAX_CELLS || end > (void*)0xc0000) {
+            ts->layout = 0;
+            return;
+        }
+    }
+    if (width > ts->xres || height > ts->yres) {
+        ts->layout = 0;
+        return;
+    }
+    u32 xoff = (ts->xres - width) / 2, yoff = (ts->yres - height) / 2;
+
+    // Redraw everything after a mode set.
+    int full = layout != ts->layout || state != ts->state;
+    if (full) {
+        ts->layout = layout;
+        ts->state = state;
+        textscan_fill(ts, 0, 0, ts->xres, yoff);
+        textscan_fill(ts, 0, yoff + height, ts->xres
+                      , ts->yres - yoff - height);
+        textscan_fill(ts, 0, yoff, xoff, height);
+        textscan_fill(ts, xoff + width, yoff, ts->xres - xoff - width, height);
+    }
+
+    u8 *dest = ts->fb + yoff * ts->pitch + xoff * 4;
+    if (mode == 0x12)
+        textscan_draw_planar(ts, dest, full, state);
+    else
+        textscan_draw_text(ts, dest, full, state);
+}
+
 // Called by the BIOS helper core whenever it is idle. Returns non-zero
-// while a text mode is shown, so that the caller keeps polling.
+// while a mode it draws is set, so that the caller keeps polling.
 u32 VISIBLE32FLAT
 textscan_poll(void)
 {
@@ -290,7 +354,7 @@ textscan_poll(void)
     return 1;
 }
 
-// Called from the BIOS timer tick. A text mode set through int 10h doesn't
+// Called from the BIOS timer tick. A mode set through int 10h doesn't
 // involve the helper core, so wake it up in case it waits with mwait.
 void
 textscan_check_event(void)

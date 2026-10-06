@@ -46,11 +46,47 @@ memset16_stride(u16 seg, void *dst, u16 val, int setlen, int stride, int lines)
  * Basic stdvga graphic manipulation
  ****************************************************************/
 
+// Without VGA hardware a planar mode can be approximated with a single bit
+// plane in RAM (see cbvga.c), where pixels are either 0 or 0x0f.
+static void
+gfx_planar_ram(struct gfx_op *op)
+{
+    void *dest_far = (void*)(op->y * op->linelength + op->x / 8);
+    u8 data = 0;
+    int pixel;
+    switch (op->op) {
+    default:
+    case GO_READ8:
+        data = GET_FARVAR(SEG_GRAPH, *(u8*)dest_far);
+        for (pixel=0; pixel<8; pixel++)
+            op->pixels[pixel] = data & (0x80 >> pixel) ? 0x0f : 0x00;
+        break;
+    case GO_WRITE8:
+        for (pixel=0; pixel<8; pixel++)
+            if (op->pixels[pixel] & 0x0f)
+                data |= 0x80 >> pixel;
+        SET_FARVAR(SEG_GRAPH, *(u8*)dest_far, data);
+        break;
+    case GO_MEMSET:
+        memset_stride(SEG_GRAPH, dest_far, op->pixels[0] & 0x0f ? 0xff : 0x00
+                      , op->xlen / 8, op->linelength, op->ylen);
+        break;
+    case GO_MEMMOVE: ;
+        void *src_far = (void*)(op->srcy * op->linelength + op->x / 8);
+        memmove_stride(SEG_GRAPH, dest_far, src_far
+                       , op->xlen / 8, op->linelength, op->ylen);
+        break;
+    }
+}
+
 static void
 gfx_planar(struct gfx_op *op)
 {
-    if (!CONFIG_VGA_STDVGA_PORTS)
+    if (!CONFIG_VGA_STDVGA_PORTS) {
+        if (CONFIG_VGA_TEXT_SCANOUT)
+            gfx_planar_ram(op);
         return;
+    }
     void *dest_far = (void*)(op->y * op->linelength + op->x / 8);
     int plane;
     switch (op->op) {
