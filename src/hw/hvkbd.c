@@ -4,14 +4,25 @@
 // channel is polled from the timer tick and the codes are fed to the
 // regular keyboard code, as for USB keyboards.
 //
+// Without an i8042 (Hyper-V Generation 2 VMs) nothing raises IRQ 1, so
+// programs that hook int 09h, like DOS keyboard drivers or the Windows
+// keyboard driver, never see a key. There the codes are queued instead
+// and, after each synthetic timer tick, raised one by one as int 09h with
+// the scancode in the BDA at 40:16h, where a driver that can't read port
+// 60h finds it. The BIOS int 09h handler reads it from there as well.
+//
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "biosvar.h" // GET_GLOBAL
+#include "bregs.h" // struct bregs
 #include "config.h" // CONFIG_HYPERV_KEYBOARD
+#include "fw/paravirt.h" // HyperVTick
+#include "hw/ps2port.h" // PORT_PS2_STATUS
 #include "hvkbd.h" // hvkbd_setup
 #include "malloc.h" // malloc_high
 #include "output.h" // dprintf
 #include "stacks.h" // call32_params
+#include "string.h" // memset
 #include "util.h" // process_key
 #include "vmbus.h" // vmbus_open
 
@@ -53,6 +64,11 @@ struct hk_message {
 // Set once the keyboard channel is open
 struct vmbus_channel *HvKbdChannel VARFSEG;
 
+// Set when keys are raised as int 09h (no i8042); codes waiting for it
+u8 HvKbdIrq VARFSEG;
+u8 HvKbdQueue[32] VARLOW;
+u8 HvKbdHead VARLOW, HvKbdTail VARLOW;
+
 void
 hvkbd_setup(void)
 {
@@ -93,6 +109,14 @@ hvkbd_setup(void)
     }
     HvKbdChannel = chan;
     dprintf(1, "found Hyper-V synthetic keyboard (relid %d)\n", relid);
+
+    // Without an i8042 (its status port floats to all ones), raise int 09h
+    // after each synthetic tick.
+    if (HyperVTick && inb(PORT_PS2_STATUS) == 0xff) {
+        HvKbdIrq = 1;
+        SET_IVT(0x09, FUNC16(entry_hvkbd_09));
+        dprintf(1, "hvkbd: keys raise int 09h, scancode at 40:16h\n");
+    }
     return;
 fail:
     dprintf(1, "hvkbd: init failed\n");
@@ -134,6 +158,44 @@ hvkbd_check_event(void)
     u8 codes[HVKBD_MAX_CODES];
     u32 i, n = call32_params(hvkbd_poll, MAKE_FLATPTR(GET_SEG(SS), codes)
                              , 0, 0, 0);
-    for (i = 0; i < n; i++)
-        process_key(codes[i]);
+    if (!GET_GLOBAL(HvKbdIrq)) {
+        for (i = 0; i < n; i++)
+            process_key(codes[i]);
+        return;
+    }
+    u8 tail = GET_LOW(HvKbdTail);
+    for (i = 0; i < n; i++) {
+        u8 next = (tail + 1) % ARRAY_SIZE(HvKbdQueue);
+        if (next == GET_LOW(HvKbdHead))
+            break;
+        SET_LOW(HvKbdQueue[tail], codes[i]);
+        tail = next;
+    }
+    SET_LOW(HvKbdTail, tail);
+}
+
+// Raise int 09h for each queued code, as the i8042 would raise IRQ 1;
+// called after each synthetic timer tick, once its interrupt is over.
+void VISIBLE16
+handle_hvkbd_irq(void)
+{
+    if (!CONFIG_HYPERV_KEYBOARD || !GET_GLOBAL(HvKbdIrq))
+        return;
+    u8 head = GET_LOW(HvKbdHead);
+    while (head != GET_LOW(HvKbdTail)) {
+        SET_BDA(kbd_scancode, GET_LOW(HvKbdQueue[head]));
+        head = (head + 1) % ARRAY_SIZE(HvKbdQueue);
+        SET_LOW(HvKbdHead, head);
+        struct bregs br;
+        memset(&br, 0, sizeof(br));
+        call16_int(0x09, &br);
+    }
+}
+
+// INT09h handler without an i8042: the scancode is in the BDA
+void VISIBLE16
+handle_hvkbd_09(void)
+{
+    debug_isr(DEBUG_ISR_09);
+    process_key(GET_BDA(kbd_scancode));
 }

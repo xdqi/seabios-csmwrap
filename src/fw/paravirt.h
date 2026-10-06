@@ -73,6 +73,7 @@ static inline int runningOnHyperV(void) {
 int qemu_cfg_enabled(void);
 int qemu_cfg_dma_enabled(void);
 void qemu_preinit(void);
+extern u8 HyperVTick;
 void hyperv_tick_setup(void);
 void qemu_platform_setup(void);
 void qemu_cfg_init(void);

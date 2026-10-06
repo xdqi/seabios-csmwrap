@@ -29,7 +29,7 @@ struct bios_data_area_s {
     u8 pad1;
     u16 mem_size_kb;
     u8 pad2;
-    u8 ps2_ctrl_flag;
+    u8 kbd_scancode;            // IRQ 1 scancode when there is no i8042
     u16 kbd_flag0;
     u8 alt_keypad;
     u16 kbd_buf_head;

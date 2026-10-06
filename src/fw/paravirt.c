@@ -117,7 +117,8 @@ static void kvm_detect(void)
 // over is dismissed harmlessly.
 #define HYPERV_TICK_VECTOR      0x7d
 
-// Set when the synthetic timer tick can replace IRQ0
+// Set when the synthetic timer tick can replace IRQ0, and still set after
+// hyperv_tick_setup() only if it does
 u8 HyperVTick VARFSEG;
 
 /* Hyper-V Generation 2 VMs have no PIT, so the TSC cannot be calibrated
@@ -161,8 +162,12 @@ static void hyperv_detect(void)
  */
 void hyperv_tick_setup(void)
 {
-    if (!HyperVTick || pit_present())
+    if (!HyperVTick)
         return;
+    if (pit_present()) {
+        HyperVTick = 0;
+        return;
+    }
     SET_IVT(HYPERV_TICK_VECTOR, FUNC16(entry_hyperv_tick));
     wrmsr(HV_X64_MSR_STIMER0_CONFIG, HV_STIMER_AUTOENABLE
           | HV_STIMER_DIRECT_MODE | (HYPERV_TICK_VECTOR << 4));

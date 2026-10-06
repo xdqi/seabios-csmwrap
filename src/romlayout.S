@@ -172,6 +172,7 @@ __farcall16:
 
         IRQ_TRAMPOLINE 02
         IRQ_TRAMPOLINE 05
+        IRQ_TRAMPOLINE 09
         IRQ_TRAMPOLINE 10
         IRQ_TRAMPOLINE 13
         IRQ_TRAMPOLINE 15
@@ -833,12 +834,14 @@ irqentry_arg:
         DECL_IRQ_ENTRY 75
         DECL_IRQ_ENTRY hwpic1
         DECL_IRQ_ENTRY hwpic2
+        DECL_IRQ_ENTRY hvkbd_09
 
         // Hyper-V Gen2 timer tick: a one-shot synthetic timer in direct
         // mode stands in for the missing PIT/PIC (see hyperv_tick_setup).
         // Chain to the IRQ0 vector, EOI the LAPIC through the synthetic EOI
-        // MSR (unlike the xAPIC MMIO page it is reachable here), then re-arm
-        // the timer one PIT tick after its previous expiry.
+        // MSR (unlike the xAPIC MMIO page it is reachable here), re-arm the
+        // timer one PIT tick after its previous expiry, then raise int 09h
+        // for queued synthetic keyboard codes (see handle_hvkbd_irq).
         DECLFUNC entry_hyperv_tick
 entry_hyperv_tick:
         int $0x08
@@ -857,7 +860,8 @@ entry_hyperv_tick:
         popl %edx
         popl %ecx
         popl %eax
-        iretw
+        pushl $handle_hvkbd_irq
+        jmp irqentry_extrastack
 
         // Without a PIC the IRQ 5 vector (0x0d) is only reached by #GP.
         // Real-mode code that uses 32-bit offsets (HIMEM's block move) hooks
