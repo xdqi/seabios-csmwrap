@@ -299,6 +299,7 @@ clock_update(void)
     usb_check_event();
     ps2_check_event();
     hvkbd_check_event();
+    textscan_check_event();
     sercon_check_event();
 }
 

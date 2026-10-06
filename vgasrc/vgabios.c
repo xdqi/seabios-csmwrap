@@ -136,9 +136,13 @@ set_active_page(u8 page)
 static void
 set_character_height(u8 lines)
 {
-    stdvga_set_character_height(lines);
+    // Text modes kept in RAM (cbvga_textscan_mode) have 400 scan lines.
+    u16 vertical_size = 400;
+    if (CONFIG_VGA_STDVGA_PORTS) {
+        stdvga_set_character_height(lines);
+        vertical_size = stdvga_get_vertical_size();
+    }
     SET_BDA(char_height, lines);
-    u16 vertical_size = stdvga_get_vertical_size();
     u8 rows = vertical_size / lines;
     SET_BDA(video_rows, rows - 1);
     u16 cols = GET_BDA(video_cols);
@@ -298,7 +302,13 @@ vga_set_mode(int mode, int flags)
         SET_BDA(cursor_type, vga_emulate_text() ? 0x0607 : 0x0000);
     }
     SET_BDA(video_pagesize, calc_page_size(memmodel, width, height));
-    SET_BDA(crtc_address, CONFIG_VGA_STDVGA_PORTS ? stdvga_get_crtc() : 0);
+    u16 crtc_addr = 0;
+    if (CONFIG_VGA_STDVGA_PORTS)
+        crtc_addr = stdvga_get_crtc();
+    else if (cbvga_textscan_mode())
+        crtc_addr = mode == 0x07 ? VGAREG_MDA_CRTC_ADDRESS
+                                 : VGAREG_VGA_CRTC_ADDRESS;
+    SET_BDA(crtc_address, crtc_addr);
     SET_BDA(char_height, cheight);
     SET_BDA(video_ctl, 0x60 | (flags & MF_NOCLEARMEM ? 0x80 : 0x00));
     SET_BDA(video_switches, 0xF9);
@@ -850,6 +860,13 @@ handle_1011(struct bregs *regs)
         case 0x11: handle_101111(regs); return;
         case 0x12: handle_101112(regs); return;
         case 0x14: handle_101114(regs); return;
+        }
+    } else if (cbvga_textscan_mode()) {
+        // The BIOS draws these modes with its own fonts.
+        switch (regs->al) {
+        case 0x11: set_character_height(14); return;
+        case 0x12: set_character_height(8); return;
+        case 0x14: set_character_height(16); return;
         }
     }
     switch (regs->al) {

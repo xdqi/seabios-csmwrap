@@ -128,6 +128,7 @@ interface_init(void)
 void
 device_hardware_setup(void)
 {
+    textscan_setup();
     usb_setup();
     ps2port_setup();
     hvkbd_setup();

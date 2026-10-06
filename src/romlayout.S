@@ -522,6 +522,14 @@ bios_proxy_helper_16_entry:
         cmpl $0, 8(%ebp)
         jne .Lhelper_handle_request
 
+#if CONFIG_VGA_TEXT_SCANOUT
+        // Show the text buffer on the framebuffer. That needs polling,
+        // so don't wait for requests with mwait while a text mode is set.
+        calll _cfunc32flat_textscan_poll - BUILD_BIOS_ADDR
+        testl %eax, %eax
+        jnz .Lhelper_do_pause
+#endif
+
         // Check if we should use mwait or pause
         testl %esi, %esi
         jz .Lhelper_do_pause

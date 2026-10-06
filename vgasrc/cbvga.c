@@ -13,6 +13,7 @@
 #include "vgabios.h" // SET_VGA
 #include "vgafb.h" // handle_gfx_op
 #include "vgautil.h" // VBE_total_memory
+#include "x86.h" // inb
 #include "svgamodes.h" // svga_modes
 
 static int CBmode VAR16;
@@ -20,10 +21,22 @@ static struct vgamode_s CBmodeinfo VAR16;
 static struct vgamode_s CBemulinfo VAR16;
 static u32 CBlinelength VAR16;
 
+// Without VGA hardware the standard text modes are kept in the legacy text
+// buffer, which the BIOS draws on the framebuffer (see src/textscan.c).
+static u8 CBtextscan VAR16;
+static struct vgamode_s CBtextmodes[] VAR16 = {
+    { MM_TEXT, 40, 25, 4, 8, 16, SEG_CTEXT }, // modes 0 and 1
+    { MM_TEXT, 80, 25, 4, 8, 16, SEG_CTEXT }, // modes 2 and 3
+    { MM_TEXT, 80, 25, 4, 8, 16, SEG_MTEXT }, // mode 7
+};
+
 struct vgamode_s *cbvga_find_mode(int mode)
 {
     if (mode == GET_GLOBAL(CBmode))
         return &CBmodeinfo;
+    if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan)
+        && (mode <= 0x03 || mode == 0x07))
+        return &CBtextmodes[mode == 0x07 ? 2 : mode / 2];
     if (mode == 0x03)
         return &CBemulinfo;
 
@@ -124,6 +137,15 @@ cbvga_set_dacformat(struct vgamode_s *curmode_g, int val)
     return -1;
 }
 
+// Check whether the current mode is a text mode kept in RAM.
+int
+cbvga_textscan_mode(void)
+{
+    struct vgamode_s *curmode_g = get_current_mode();
+    return CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan) && curmode_g
+        && GET_GLOBAL(curmode_g->memmodel) == MM_TEXT;
+}
+
 int
 cbvga_save_restore(int cmd, u16 seg, void *data)
 {
@@ -145,6 +167,18 @@ cbvga_set_mode(struct vgamode_s *vmode_g, int flags)
      */
     u8 extra_stack = GET_BDA_EXT(flags) & BF_EXTRA_STACK;
     MASK_BDA_EXT(flags, BF_EMULATE_TEXT, emul ? BF_EMULATE_TEXT : 0);
+    if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan)
+        && GET_GLOBAL(vmode_g->memmodel) == MM_TEXT) {
+        if (!(flags & MF_NOCLEARMEM))
+            memset16_far(GET_GLOBAL(vmode_g->sstart), (void*)0, 0x0720
+                         , 32*1024);
+        // Have the BIOS redraw the whole screen.
+        MASK_BDA_EXT(flags, 0, BF_TEXT_SCANOUT);
+        return 0;
+    }
+    if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan))
+        // Stop the BIOS drawing text before the framebuffer gets cleared.
+        SET_BDA(video_mode, 0xff);
     if (!(flags & MF_NOCLEARMEM)) {
         if (GET_GLOBAL(CBmodeinfo.memmodel) == MM_TEXT) {
             memset16_far(SEG_CTEXT, (void*)0, 0x0720, 80*25*2);
@@ -220,6 +254,28 @@ cbvga_setup_modes(u64 addr, u8 bpp, u32 xlines, u32 ylines, u32 linelength)
     }
 }
 
+// Check whether the standard VGA registers respond.
+static int
+cbvga_vga_present(void)
+{
+    u8 index = inb(VGAREG_GRDC_ADDRESS);
+    outb(0x05, VGAREG_GRDC_ADDRESS);
+    u8 val = inb(VGAREG_GRDC_ADDRESS);
+    outb(index, VGAREG_GRDC_ADDRESS);
+    return val != 0xff || inb(VGAREG_READ_MISC_OUTPUT) != 0xff;
+}
+
+// Check whether memory at the given segment keeps what is written to it.
+static int
+cbvga_is_ram(u16 seg)
+{
+    u16 old = GET_FARVAR(seg, *(u16*)0);
+    SET_FARVAR(seg, *(u16*)0, 0x55aa);
+    int ret = GET_FARVAR(seg, *(u16*)0) == 0x55aa;
+    SET_FARVAR(seg, *(u16*)0, old);
+    return ret;
+}
+
 int
 cbvga_setup(void)
 {
@@ -271,5 +327,12 @@ cbvga_setup(void)
     }
 
     cbvga_setup_modes(addr, bpp, xlines, ylines, linelength);
+
+    if (CONFIG_VGA_TEXT_SCANOUT && bpp == 32 && xlines >= 80*8
+        && ylines >= 25*16 && !cbvga_vga_present()
+        && cbvga_is_ram(SEG_CTEXT) && cbvga_is_ram(SEG_MTEXT)) {
+        dprintf(1, "No VGA hardware - keeping text modes in RAM\n");
+        SET_VGA(CBtextscan, 1);
+    }
     return 0;
 }

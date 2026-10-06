@@ -266,6 +266,10 @@ void sercon_check_event(void);
 void serial_setup(void);
 void lpt_setup(void);
 
+// textscan.c
+void textscan_setup(void);
+void textscan_check_event(void);
+
 // version.c
 extern const char VERSION[], BUILDINFO[];
 

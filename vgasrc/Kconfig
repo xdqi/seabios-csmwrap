@@ -139,6 +139,18 @@ menu "VGA ROM"
             Support emulating text mode features when only a
             framebuffer is available.
 
+    config VGA_TEXT_SCANOUT
+        depends on VGA_COREBOOT && CSM
+        bool "Show the legacy text buffer on the framebuffer"
+        default y
+        help
+            On machines without VGA hardware whose legacy text buffer
+            at 0xb8000 is plain RAM (e.g. Hyper-V Generation 2 VMs),
+            keep the standard text modes in that buffer, like VGA
+            hardware does, and have the BIOS helper core of CSMWrap
+            draw it on the framebuffer periodically. This makes text
+            that software writes to the buffer directly visible.
+
     config VGA_FIXUP_ASM
         depends on BUILD_VGABIOS
         bool "Fixup assembler to work with broken emulators"
