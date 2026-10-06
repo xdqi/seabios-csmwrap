@@ -15,6 +15,7 @@
 #include "vgautil.h" // VBE_total_memory
 #include "x86.h" // inb
 #include "svgamodes.h" // svga_modes
+#include "textscan.h" // struct scanout_s
 
 static int CBmode VAR16;
 static struct vgamode_s CBmodeinfo VAR16;
@@ -137,6 +138,21 @@ cbvga_set_dacformat(struct vgamode_s *curmode_g, int val)
     return -1;
 }
 
+// Publish the current mode for the BIOS scan-out (see src/textscan.h).
+static void
+cbvga_scanout_set(u8 mode)
+{
+    struct scanout_s *so = (void*)SCANOUT_OFFSET;
+    u32 state = GET_FARVAR(SCANOUT_SEG, so->state);
+    u16 gen = 0;
+    if (GET_FARVAR(SCANOUT_SEG, so->signature) == SCANOUT_SIGNATURE
+        && SCANOUT_STATE_VALID(state))
+        gen = (state >> 16) + 1;
+    else
+        SET_FARVAR(SCANOUT_SEG, so->signature, SCANOUT_SIGNATURE);
+    SET_FARVAR(SCANOUT_SEG, so->state, SCANOUT_STATE(mode, gen));
+}
+
 // Check whether the current mode is a text mode kept in RAM.
 int
 cbvga_textscan_mode(void)
@@ -151,7 +167,11 @@ cbvga_save_restore(int cmd, u16 seg, void *data)
 {
     if (cmd & (SR_HARDWARE|SR_DAC|SR_REGISTERS))
         return -1;
-    return bda_save_restore(cmd, seg, data);
+    int ret = bda_save_restore(cmd, seg, data);
+    if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan)
+        && cmd & SR_RESTORE && cmd & SR_BDA)
+        cbvga_scanout_set(GET_BDA(video_mode));
+    return ret;
 }
 
 int
@@ -172,13 +192,14 @@ cbvga_set_mode(struct vgamode_s *vmode_g, int flags)
         if (!(flags & MF_NOCLEARMEM))
             memset16_far(GET_GLOBAL(vmode_g->sstart), (void*)0, 0x0720
                          , 32*1024);
-        // Have the BIOS redraw the whole screen.
-        MASK_BDA_EXT(flags, 0, BF_TEXT_SCANOUT);
+        // Have the BIOS draw the mode (and the whole screen again).
+        cbvga_scanout_set(vmode_g == &CBtextmodes[2] ? 0x07
+                          : vmode_g == &CBtextmodes[1] ? 0x03 : 0x01);
         return 0;
     }
     if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(CBtextscan))
-        // Stop the BIOS drawing text before the framebuffer gets cleared.
-        SET_BDA(video_mode, 0xff);
+        // Stop the BIOS drawing before the framebuffer gets cleared.
+        cbvga_scanout_set(SCANOUT_NONE);
     if (!(flags & MF_NOCLEARMEM)) {
         if (GET_GLOBAL(CBmodeinfo.memmodel) == MM_TEXT) {
             memset16_far(SEG_CTEXT, (void*)0, 0x0720, 80*25*2);

@@ -56,7 +56,6 @@ struct vga_bda_s {
 #define BF_EMULATE_TEXT 0x10
 #define BF_SWCURSOR     0x20
 #define BF_EXTRA_STACK  0x40
-#define BF_TEXT_SCANOUT 0x80 // text mode set, BIOS must redraw (src/textscan.c)
 
 #define GET_BDA_EXT(var) \
     GET_FARVAR(SEG_BDA, ((struct vga_bda_s *)VGA_CUSTOM_BDA)->var)

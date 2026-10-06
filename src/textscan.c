@@ -7,8 +7,9 @@
 // call32 request, draws the buffer on the framebuffer periodically, much
 // like a VGA CRTC scans out its text memory. Software that writes the
 // buffer directly thus becomes visible, and nothing is drawn as soon as
-// the video mode in the BDA is not a text mode, e.g. after an operating
-// system set a graphics mode.
+// SeaVGABIOS sets a graphics mode, e.g. for an operating system. It tells
+// which mode is set through video memory (see textscan.h), as the BDA is
+// not updated when Windows XP's VideoPortInt10 sets a mode.
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
@@ -19,12 +20,9 @@
 #include "output.h" // dprintf
 #include "stacks.h" // call16_int
 #include "string.h" // memset
+#include "textscan.h" // struct scanout_s
 #include "util.h" // find_cb_table
 #include "x86.h" // rdtscll
-
-// SeaVGABIOS flags in the BDA (see vgasrc/vgabios.h)
-#define VGA_BDA_FLAGS           0xb9
-#define BF_TEXT_SCANOUT         0x80
 
 #define CB_TAG_FRAMEBUFFER      0x0012
 struct cb_framebuffer {
@@ -55,6 +53,7 @@ struct textscan_s {
     u8 *font[4];                // 8x8 (chars 0-127, 128-255), 8x14, 8x16
     u32 palette[16];
     u32 layout;                 // geometry on screen, 0 if not drawn
+    u32 state;                  // scan-out state drawn (see textscan.h)
     int cursor;                 // cell with the cursor drawn, -1 if none
     u16 cursor_lines;
     u16 shadow[TEXTSCAN_MAX_CELLS]; // cells on screen
@@ -64,6 +63,38 @@ struct textscan_s *TextScan VARFSEG;
 // Set while no text mode is shown, when the helper core may wait for
 // requests with mwait.
 u8 TextScanIdle VARFSEG;
+
+// Get the scan-out state published by SeaVGABIOS, or 0 if there is none.
+static u32
+textscan_published(void)
+{
+    struct scanout_s *so = (void*)SCANOUT_OFFSET;
+    u32 state = GET_FARVAR(SCANOUT_SEG, so->state);
+    if (GET_FARVAR(SCANOUT_SEG, so->signature) != SCANOUT_SIGNATURE
+        || !SCANOUT_STATE_VALID(state))
+        return 0;
+    return state;
+}
+
+// Get the scan-out state. Should something have overwritten the published
+// one (e.g. a DOS memory manager mapping memory there), fall back to the
+// BDA, which then is in use.
+static u32
+textscan_state(void)
+{
+    u32 state = textscan_published();
+    if (!state)
+        state = SCANOUT_STATE(GET_BDA(video_mode), 0xffff);
+    return state;
+}
+
+// Check whether a scan-out state is a mode drawn by textscan_poll.
+static int
+textscan_mode(u32 state)
+{
+    u8 mode = state;
+    return SCANOUT_STATE_VALID(state) && (mode <= 0x03 || mode == 0x07);
+}
 
 // Get a font of SeaVGABIOS.
 static u8 *
@@ -83,8 +114,7 @@ void
 textscan_setup(void)
 {
     ASSERT32FLAT();
-    u8 *flags = MAKE_FLATPTR(SEG_BDA, VGA_BDA_FLAGS);
-    if (!CONFIG_VGA_TEXT_SCANOUT || !(*flags & BF_TEXT_SCANOUT))
+    if (!CONFIG_VGA_TEXT_SCANOUT || !textscan_mode(textscan_published()))
         return;
     struct cb_header *cbh = find_cb_table();
     if (!cbh)
@@ -145,8 +175,9 @@ textscan_fill(struct textscan_s *ts, u32 x, u32 y, u32 w, u32 h)
 
 // Draw the cells of the text buffer that changed since the last call.
 static void
-textscan_draw(struct textscan_s *ts, u8 mode)
+textscan_draw(struct textscan_s *ts, u32 state)
 {
+    u8 mode = state;
     u32 cols = GET_BDA(video_cols), rows = GET_BDA(video_rows) + 1;
     u32 cheight = GET_BDA(char_height), cwidth = cols <= 40 ? 16 : 8;
     u32 width = cols * cwidth, height = rows * cheight;
@@ -161,14 +192,12 @@ textscan_draw(struct textscan_s *ts, u8 mode)
     }
     u32 xoff = (ts->xres - width) / 2, yoff = (ts->yres - height) / 2;
 
-    // Redraw everything after a mode change.
+    // Redraw everything after a mode set.
     u32 layout = cols << 16 | rows << 8 | cheight;
-    u8 *flags = MAKE_FLATPTR(SEG_BDA, VGA_BDA_FLAGS);
-    int full = layout != ts->layout || *flags & BF_TEXT_SCANOUT;
+    int full = layout != ts->layout || state != ts->state;
     if (full) {
-        asm volatile("lock andb %1, %0"
-                     : "+m"(*flags) : "i"((u8)~BF_TEXT_SCANOUT) : "memory");
         ts->layout = layout;
+        ts->state = state;
         textscan_fill(ts, 0, 0, ts->xres, yoff);
         textscan_fill(ts, 0, yoff + height, ts->xres
                       , ts->yres - yoff - height);
@@ -208,7 +237,7 @@ textscan_draw(struct textscan_s *ts, u8 mode)
             if (cell == ts->shadow[i] && !full && i != cursor && i != oldcursor)
                 continue;
             // Stop as soon as the text mode is left.
-            if (GET_BDA(video_mode) != mode) {
+            if (textscan_state() != state) {
                 ts->layout = 0;
                 return;
             }
@@ -245,7 +274,8 @@ textscan_poll(void)
     struct textscan_s *ts = TextScan;
     if (!CONFIG_VGA_TEXT_SCANOUT || !ts)
         return 0;
-    u8 mode = GET_BDA(video_mode), idle = mode > 3 && mode != 7;
+    u32 state = textscan_state();
+    u8 idle = !textscan_mode(state);
     if (TextScanIdle != idle)
         TextScanIdle = idle;
     if (idle) {
@@ -256,7 +286,7 @@ textscan_poll(void)
     if ((s32)(now - ts->next) < 0)
         return 1;
     ts->next = now + ts->interval;
-    textscan_draw(ts, mode);
+    textscan_draw(ts, state);
     return 1;
 }
 
@@ -265,9 +295,7 @@ textscan_poll(void)
 void
 textscan_check_event(void)
 {
-    if (!CONFIG_VGA_TEXT_SCANOUT || !GET_GLOBAL(TextScanIdle))
-        return;
-    u8 mode = GET_BDA(video_mode);
-    if (mode <= 3 || mode == 7)
+    if (CONFIG_VGA_TEXT_SCANOUT && GET_GLOBAL(TextScanIdle)
+        && textscan_mode(textscan_state()))
         call32(textscan_poll, 0, 0);
 }
