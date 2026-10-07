@@ -195,17 +195,53 @@ struct vmpacket_descriptor {
 u32 VmbusHypercallPage VARFSEG;
 u8 *VmbusSendIntPage VARFSEG;
 
+// The host sends the offers only once per connection, so drivers of
+// real-mode systems (DOS, Windows 3.x/9x) that keep using this connection
+// instead of making their own find them here. The header sits on a 16-byte
+// boundary of the f-segment and gets its signature once the connection is
+// up. All addresses are physical. The offer table stays in reserved memory;
+// "chan" points to the struct vmbus_channel of a channel the BIOS opened,
+// whose rings it keeps using. Messages (SIMP, SINT) are left to the driver;
+// the BIOS masks the SINT once it is done with them.
+#define VMBUS_HANDOFF_SIGNATURE 0x7375426d56764824ULL // "$HvVmBus"
+
+struct vmbus_handoff_offer {
+    u8 if_type[16];
+    u8 if_instance[16];
+    u32 relid;
+    u32 connid;
+    u32 chan;
+} PACKED;
+
+struct vmbus_handoff {
+    u64 signature;
+    u8 length;                  // of this header
+    u8 revision;
+    u8 sint;                    // SINT of the connection's messages
+    u8 offer_count;
+    u32 version;                // negotiated VMBus version
+    u32 msg_conn_id;            // connection id for HvPostMessage
+    u32 vp_index;               // target VP of the connection
+    u32 int_page;               // interrupt page (send half at +2048)
+    u32 monitor_pages;          // two monitor pages
+    u32 offers;                 // struct vmbus_handoff_offer[offer_count]
+    u32 next_gpadl;             // GPADL handles from here on are unused
+} PACKED;
+
+struct vmbus_handoff VmbusHandoff VARFSEG __aligned(16) = {
+    .length = sizeof(struct vmbus_handoff),
+    .revision = 1,
+    .sint = VMBUS_MESSAGE_SINT,
+    .msg_conn_id = VMBUS_MESSAGE_CONNECTION_ID,
+};
+
 // Init-only state
 static struct hv_message *VmbusMsgSlot;
 static struct hv_post_message_input *VmbusPostInput;
 static u32 VmbusVpIndex, VmbusNextGpadl = 0xe1e10;
 
 #define VMBUS_MAX_OFFERS 32
-static struct {
-    u8 if_type[16];
-    u32 relid;
-    u32 connid;
-} VmbusOffers[VMBUS_MAX_OFFERS];
+static struct vmbus_handoff_offer *VmbusOffers;
 static int VmbusOfferCount;
 
 
@@ -320,6 +356,8 @@ vmbus_connect(void)
     memset(int_page, 0, PAGE_SIZE);
     memset(monitor, 0, 2 * PAGE_SIZE);
     VmbusSendIntPage = int_page + PAGE_SIZE / 2;
+    VmbusHandoff.int_page = virt_to_phys(int_page);
+    VmbusHandoff.monitor_pages = virt_to_phys(monitor);
 
     int i;
     for (i = 0; i < ARRAY_SIZE(versions); i++) {
@@ -341,6 +379,7 @@ vmbus_connect(void)
                 , versions[i], resp->version_supported, resp->connection_state);
         if (resp->version_supported) {
             dprintf(1, "vmbus: connected, version %x\n", versions[i]);
+            VmbusHandoff.version = versions[i];
             return 0;
         }
     }
@@ -364,17 +403,16 @@ vmbus_request_offers(void)
         }
         if (t == CHANNELMSG_ALLOFFERS_DELIVERED)
             return;
-        if (t != CHANNELMSG_OFFERCHANNEL
-            || VmbusOfferCount >= ARRAY_SIZE(VmbusOffers))
+        if (t != CHANNELMSG_OFFERCHANNEL || VmbusOfferCount >= VMBUS_MAX_OFFERS)
             continue;
         struct vmbus_offer_channel *offer = (void *)buf;
         dprintf(3, "vmbus: offer relid %d conn %x type %08x\n"
                 , offer->child_relid, offer->connection_id
                 , *(u32 *)offer->if_type);
-        memcpy(VmbusOffers[VmbusOfferCount].if_type, offer->if_type, 16);
-        VmbusOffers[VmbusOfferCount].relid = offer->child_relid;
-        VmbusOffers[VmbusOfferCount].connid = offer->connection_id;
-        VmbusOfferCount++;
+        struct vmbus_handoff_offer *o = &VmbusOffers[VmbusOfferCount++];
+        memcpy(o->if_type, offer->if_type, 32); // and if_instance
+        o->relid = offer->child_relid;
+        o->connid = offer->connection_id;
     }
 }
 
@@ -399,11 +437,13 @@ vmbus_setup(void)
     void *hypercall = memalign_high(PAGE_SIZE, PAGE_SIZE);
     VmbusMsgSlot = memalign_high(PAGE_SIZE, PAGE_SIZE);
     VmbusPostInput = memalign_high(PAGE_SIZE, PAGE_SIZE);
-    if (!hypercall || !VmbusMsgSlot || !VmbusPostInput) {
+    VmbusOffers = malloc_high(VMBUS_MAX_OFFERS * sizeof(*VmbusOffers));
+    if (!hypercall || !VmbusMsgSlot || !VmbusPostInput || !VmbusOffers) {
         warn_noalloc();
         return -1;
     }
     memset(VmbusMsgSlot, 0, PAGE_SIZE);
+    memset(VmbusOffers, 0, VMBUS_MAX_OFFERS * sizeof(*VmbusOffers));
 
     wrmsr(HV_X64_MSR_GUEST_OS_ID, HV_GUEST_OS_ID_SEABIOS);
     wrmsr(HV_X64_MSR_HYPERCALL, virt_to_phys(hypercall) | 1);
@@ -428,7 +468,8 @@ vmbus_setup(void)
 
 // Messages are only needed during setup. Mask the message SINT and drop
 // the message page so that an OS VMBus driver can take over (the minimum
-// Windows needs); the rings and the hypercall page stay in use.
+// Windows needs); the rings and the hypercall page stay in use. Then
+// publish the connection (see VmbusHandoff).
 void
 vmbus_quiesce(void)
 {
@@ -437,6 +478,13 @@ vmbus_quiesce(void)
     wrmsr(HV_X64_MSR_SINT0 + VMBUS_MESSAGE_SINT, HV_SINT_MASKED);
     wrmsr(HV_X64_MSR_SIMP, 0);
     VmbusMsgSlot = NULL;
+    if (!VmbusHypercallPage)
+        return;
+    VmbusHandoff.vp_index = VmbusVpIndex;
+    VmbusHandoff.offers = virt_to_phys(VmbusOffers);
+    VmbusHandoff.offer_count = VmbusOfferCount;
+    VmbusHandoff.next_gpadl = VmbusNextGpadl;
+    VmbusHandoff.signature = VMBUS_HANDOFF_SIGNATURE;
 }
 
 // Collect up to max offers of the given interface type.
@@ -511,6 +559,9 @@ vmbus_open(struct vmbus_channel *chan, u32 relid, u32 connid, u32 ring_pages)
         return -1;
     }
 
+    for (i = 0; i < VmbusOfferCount; i++)
+        if (VmbusOffers[i].relid == relid)
+            VmbusOffers[i].chan = virt_to_phys(chan);
     chan->child_relid = relid;
     chan->connection_id = connid;
     chan->out = (void *)ring;
